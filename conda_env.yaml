@@ -1,0 +1,26 @@
+name: HiFi_Bin2
+channels:
+    - bioconda
+    - anaconda
+    - conda-forge
+    - defaults
+dependencies:
+    - snakemake >=5.5.6
+    - python
+    - biopython
+    - bowtie2 
+    - samtools
+    - prodigal
+    - blast
+    - concoct
+    - gfapy
+    - future
+    - pysam
+    - pygam
+    - statsmodels
+    - metabat2
+    - diamond
+    - gtdbtk
+    - bedtools
+    - minimap2
+    - mmseqs2

@@ -1,0 +1,153 @@
+import glob
+import pysam
+import numpy as np
+from collections import defaultdict,Counter
+from os.path import basename,dirname,realpath,abspath
+from Bio.SeqIO.FastaIO import SimpleFastaParser as sfp
+
+
+# same as HIFI_annoataiotn_on_graph but without graph
+
+SCRIPTS = "/mnt/gpfs2/seb/Project/Metahood/scripts"
+SCG_DATA = "/mnt/gpfs2/seb/Project/Metahood/scg_data"
+COG_DB = "/mnt/gpfs2/seb/Database/rpsblast_cog_db/Cog"
+
+ROOT = config["ROOT"]
+CONTIGS = config["CONTIGS"]
+PID = "0.99"
+
+
+rule results:
+    input: "%s/annotation/SCG_cluster_%s.tsv"%(ROOT,PID),
+         #  "%s/plasmidnet/results.tsv"%ROOT,
+           "%s/annotation/summary_0.99.tsv"%ROOT
+
+rule symlink_contigs:
+	output: "{path}/contigs/contigs.fa"
+	run:
+		if CONTIGS.endswith(".gz"):
+			shell("zcat {CONTIGS} > {output}")
+		else:
+			shell("ln -s {CONTIGS} {output}")
+
+rule prodigal:
+    input:
+        "{path}/contigs/contigs.fa"
+    output:
+        faa="{path}/annotation/contigs.faa",
+        fna="{path}/annotation/contigs.fna",
+        gff="{path}/annotation/contigs.gff",
+        cut_faa=expand("{{path}}/annotation/temp_splits/Batch_{nb}.faa",nb=range(100))
+    params:
+        dir='{path}/annotation'
+    threads:
+        1000
+    message:"Parallel prodigal run in {input}"
+    shell:
+        "{SCRIPTS}/Parallel_prodigal.py {threads} {input} -s 100 -o {params.dir} -T {params.dir}/temp_splits"
+
+# ----- get rpsblast annotation
+rule Batch_rpsblast:
+    input:   "{path}.faa"
+    output:  "{path}.cogs.tsv"
+    log:     "{path}_cog.log"
+    params:  db = COG_DB
+    shell:   """
+             rpsblast+ -outfmt '6 qseqid sseqid evalue pident length slen qlen' -evalue 0.00001 -query {input} -db {params.db} -out {output} &>{log}
+             """
+
+#------- select best hit and use criterion : min 5% coverage, min 1e-10 evalue--------------
+rule parse_cogs_annotation:
+    input:   Batch=expand("{{path}}/temp_splits/Batch_{nb}.cogs.tsv",nb=range(100))
+    output:  cog="{path}/contigs_cogs_best_hits.tsv",
+             cat=temp("{path}/contigs_Cog.out")
+    shell:   """
+             cat {input} > {output.cat}   
+             {SCRIPTS}/Filter_Cogs.py {output.cat} --cdd_cog_file {SCG_DATA}/cdd_to_cog.tsv  > {output.cog}
+             """
+
+#------- extract scg --------------
+rule extract_SCG_sequences:
+    input:  annotation="{filename}_cogs_best_hits.tsv",
+            gff="{filename}.gff",
+            fna="{filename}.fna"
+    output: "{filename}_SCG.fna"
+    shell:  "{SCRIPTS}/Extract_SCG.py {input.fna} {input.annotation} {SCG_DATA}/scg_cogs_min0.97_max1.03_unique_genera.txt {input.gff}>{output}"
+
+rule cluster_SCG:
+    input:  "{path}/{name}_SCG.fna"
+    output: "{path}/{name}_{pid}_mmseqs_cluster.tsv"
+    params: tmp = "{path}/mmseq_tmp_{pid}",
+            out = "{path}/{name}_{pid}_mmseqs"
+    threads: 10
+    shell:  "mmseqs easy-cluster {input} {params.out} {params.tmp} --min-seq-id {wildcards.pid} -c 0.8 --cov-mode 1 --alignment-mode 3 --threads {threads}"
+
+rule scg_cluster_def:
+    input: clu = "{path}/contigs_{pid}_mmseqs_cluster.tsv",
+           scg = "{path}/contigs_SCG.fna"
+    output: "{path}/SCG_cluster_{pid}.tsv"
+    run:
+        # get orf to SCG
+        orf_to_scg = {header.split()[0]:header.split()[1] for header,_ in sfp(open(input["scg"]))}
+
+        # get clu def
+        orf_to_clu = defaultdict(lambda :defaultdict(list))
+        for line in open(input["clu"]):
+            rep,orf = line.rstrip().split("\t")
+            orf_to_clu[orf_to_scg[rep]][rep].append(orf)
+
+        # output
+        with open(output[0],"w") as handle:
+            handle.writelines("%s\t%s\t%s\n"%(cog,index,"\t".join(orfs)) for cog,clus in orf_to_clu.items() for index,(ref,orfs) in enumerate(clus.items()))
+
+
+
+# ------ get contigs quality -----------
+rule bogus_bed:
+    input:   contig="{group}/contigs/contigs.fa"
+    output:  bed="{group}/annotation/contigs.bed"
+    run :
+        handle=open(output['bed'],"w")
+        for header,seq in sfp(open(input["contig"])) :
+            name=header.split(" ")[0]
+            handle.write("\t".join([name,"0",str(len(seq)),name+"\n"]))
+        handle.close()
+
+
+rule get_component_quality:
+    input: scgs = "{path}/annotation/SCG_cluster_{pid}.tsv",
+           cogs = "{path}/annotation/contigs_cogs_best_hits.tsv",
+           cont_len = "{path}/annotation/contigs.bed"
+    output: summary = "{path}/annotation/summary_{pid}.tsv"
+    run:
+        # get component
+        contig_to_len = {line.rstrip().split("\t")[0]:int(line.rstrip().split("\t")[2]) for line in open(input["cont_len"])}
+
+        # get scgs clusters
+        orfs_to_cog = {}
+        cog_to_orfs = defaultdict(list)
+        for line in open(input["scgs"]):
+            cog = "_".join(line.rstrip().split("\t")[0:2])
+            for orf in line.rstrip().split("\t")[2:]:
+                orfs_to_cog[orf] = cog
+                cog_to_orfs[cog].append(orf)
+
+        # get scg cog annotation
+        scg_to_cog = {line.rstrip().split("\t")[0]:line.rstrip().split("\t")[1] for index,line in enumerate(open(input["cogs"])) if index>0}
+
+        # build mapping of scg to contigs
+        contigs_to_scgs = defaultdict(set)
+        for orf,cog in orfs_to_cog.items():
+            contig = "_".join((orf.split('_')[:-1]))
+            contigs_to_scgs[contig].add(cog)
+
+        # get completion,contamination
+        get_cogs = lambda x:Counter([el.split("_")[0] for el in contigs_to_scgs[x]])
+        unique = lambda x:sum([val==1 for val in get_cogs(x).values()])/36.
+        contamination = lambda x:(sum(get_cogs(x).values())-len(get_cogs(x)))/36.
+        completion = lambda x:len(get_cogs(x))/36.
+
+        sorted_contigs = sorted(contig_to_len.keys(),key=lambda x:-contig_to_len[x])
+        with open(output["summary"],"w") as handle:
+            handle.write("contig\tuniq_scg\tcomp\tcont\tnuc_size\n")
+            handle.writelines("%s\t%s\t%s\t%s\t%s\n"%(contig,"{:.0%}".format(unique(contig)),"{:.0%}".format(completion(contig)),"{:.0%}".format(contamination(contig)),contig_to_len[contig]) for contig in sorted_contigs)
