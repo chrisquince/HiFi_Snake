@@ -1,0 +1,894 @@
+import os
+import glob
+from Bio.SeqIO.FastaIO import SimpleFastaParser as sfp
+from Bio.SeqIO.QualityIO import FastqGeneralIterator as fgi
+from os.path import basename,dirname,realpath,abspath
+from collections import defaultdict,Counter
+import pysam
+import gzip
+import numpy as np
+
+
+# ----------- Run dependant variables ----------- 
+# you needs reads, short & long, graph if hifiasm, as well as an assembly and corresponding orfs/cogs annotation
+ROOT = config["ROOT"]
+SAMPLE_DIR = config["SAMPLE_DIR"]
+SAMPLE_SHORT = config["SAMPLE_SHORT"]
+ASM_TYPE = config["ASM_TYPE"] # if mdbg graph doesn't exist and circular contig end in c instead of l
+
+assert ASM_TYPE in {"mdbg","hifiasm"}, 'please use either "mdbg" or "hifiasm" for mode'
+
+# snakemake -s /mnt/gpfs/seb/Applications/Snakescripts/HIFI_binning.snake --config ROOT="/mnt/gpfs/seb/Project/temp/HIFI_annotation/Mouse77_ctg_new" SAMPLE_DIR="/mnt/gpfs/chris/MouseHiFi/Samples/Mouse77" SAMPLE_SHORT='/home/sebr/seb/Project/temp/EI_MOCKS2/data_for_strong/77*'
+
+# snakemake -s /mnt/gpfs2/seb/Applications/Snakescripts/HIFI_binning.snake -n --cores 100 --config ROOT="/mnt/gpfs2/seb/Project/temp/HIFI_annotation/plankton_mdbg" SAMPLE_DIR="/mnt/gpfs2/seb/Project/temp/Plankton/data/hifi/" SAMPLE_SHORT='/mnt/gpfs2/seb/Project/temp/Plankton/data/short_reads/*/' ASM_TYPE="mdbg"
+
+
+# snakemake -s /mnt/gpfs/seb/Applications/Snakescripts/HIFI_binning.snake --config ROOT="/mnt/gpfs/seb/Project/temp/HIFI_annotation/Mouse77_utg_new" SAMPLE_DIR="/mnt/gpfs/chris/MouseHiFi/Samples/Mouse77" SAMPLE_SHORT='/home/sebr/seb/Project/temp/EI_MOCKS2/data_for_strong/77*' --cores 100
+
+# snakemake -s /mnt/gpfs/seb/Applications/Snakescripts/HIFI_binning.snake --config ROOT="/mnt/gpfs/cyanoProject/HiFiResults/CP1_CP2_coassembly_contigs" SAMPLE_DIR="/mnt/gpfs/chris/Projects/cyanoProject/HiFi" SAMPLE_SHORT='/mnt/gpfs/cyanoProject/sarahdata_2021_analysis/data/WGS/strong_folder/*'
+
+
+
+# binning based on hifi reads
+SAMPLES = {basename(dirname(file)).replace(".fastq.gz",""):file for file in glob.glob('%s/*/*.fastq*'%SAMPLE_DIR)}
+# chris thing
+SAMPLES.update({basename(file).split(".fastq")[0]:file for file in glob.glob('%s/*.fastq'%SAMPLE_DIR)})
+SAMPLES.update({basename(file).split(".fastq.gz")[0]:file for file in glob.glob('%s/*.fastq.gz'%SAMPLE_DIR)})
+
+# binning based on short reads
+R1 = {basename(dirname(file)):file for file in glob.glob('%s/*R1*f*q.gz'%SAMPLE_SHORT)}
+R2 = {basename(dirname(file)):file for file in glob.glob('%s/*R2*f*q.gz'%SAMPLE_SHORT)}
+
+# just snakemake thing
+READ_TYPE = {"sr":R1,"hifi":SAMPLES}
+
+# get read length distribution
+kallisto_file = "%s/profile/reads_length.tsv"%ROOT
+if not os.path.isfile(kallisto_file):
+    os.system("mkdir -p $(dirname %s)"%kallisto_file)
+    with open(kallisto_file,"w") as handle:
+        for sample,file in SAMPLES.items():
+            print(sample)
+            length = [len(read[1]) for read in fgi(gzip.open(file,"rt"))]
+            mean = np.mean(length)
+            std = np.std(length)
+            handle.write("%s\t%s\t%s\n"%(sample,mean,std))
+KALLISTO_STATS = {line.rstrip().split("\t")[0]:line.rstrip().split("\t")[1:] for line in open(kallisto_file)}
+
+# -------------------------------------------- 
+SCRIPTS = "/mnt/gpfs2/seb/Project/Metahood/scripts"
+SCRIPTS2 = "/mnt/gpfs2/seb/Applications/scripts"
+MIN_CONTIG_SIZE_METABAT2 = 1500
+MIN_CONTIG_SIZE = 1000
+SCG_DATA = "/mnt/gpfs2/seb/Project/Metahood/scg_data"
+THREADS = 50
+MAX_BIN_NB = 2000
+CONDA_ENV = "/mnt/gpfs2/seb/Project/Metahood/conda_envs"
+STR_SCRIPTS = "/mnt/gpfs2/seb/Project/STRONG/SnakeNest/scripts"
+
+# -------------- real start of the snakemake --------------
+wildcard_constraints:
+    sample = "|".join(SAMPLES.keys()),
+    sample_sr = "|".join(R1.keys()),
+    sample_both = "|".join(list(R1.keys())+list(SAMPLES.keys())),
+    binner = "|".join(["%s_%s"%(binner,read_type) for binner in ["concoct","consensus","metabat2"] for read_type in ["sr","hifi"]]),
+    binR = "|".join(["concoct","consensus","metabat2"]),
+    type = "|".join(["contigs","orfs","contigs_C10K"]),
+    read_type = "|".join(["sr","hifi"])
+
+
+rule results:
+    input: expand("%s/profile/mag_{binner}_{read_type}_percent_mapped.tsv"%ROOT,binner=["concoct","consensus","metabat2"],read_type=["hifi"]),
+           "%s/MAGs/gtdb_hifi/gtdbtk.ar122.classify.tree"%ROOT,
+           #expand("%s/kallisto_map/{sample}/abundance.tsv"%ROOT,sample = SAMPLES),
+
+
+# rule result_kallisto:
+#     input: "Hifiasm/AD2W20_utg/binning/kallisto_consensus/kallisto_consensus_MAG_nb.txt"
+
+# ------------ deal with component/circular mags ----------------
+# if a contig is circular and a mag don't bin it
+# if it is circular and not a mag bin it anyway, migth cooccur with something.
+
+if ASM_TYPE =="hifiasm":
+    ASSEMBLY_GRAPH = "%s/graph/contigs.gfa"%ROOT
+    assert os.path.isfile(ASSEMBLY_GRAPH), "no assembly graph found at %s"%ASSEMBLY_GRAPH
+
+    rule filter_circ_mags:
+        input: summary = "{path}/annotation/comp_mags_0.99.tsv",
+               comp = "{path}/graph/component.txt",
+               cont = "{path}/contigs/contigs.fa"
+        output: mag = "{path}/MAGs/mags/circ.done"
+        run:
+            # mag comp 
+            comp_mags = {line.rstrip().split("\t")[0] for line in open(input["summary"])}
+            mags_cont = {cont for line in open(input["comp"]) for cont in line.rstrip().split("\t")[1:] if line.rstrip().split("\t")[0] in comp_mags}
+
+            # get circ seq first then write everything
+            circ = set()
+            for line in open(ASSEMBLY_GRAPH):
+                if line[0]=="L":
+                    L,node1,s1,node2,s2,cigar,*_ = line.rstrip().split("\t")
+                    if node1 in mags_cont:
+                        if (node1==node2)&(s1==s2):
+                            circ.add(node1)
+
+            # output mag circ as independant mag :
+            folder = dirname(output["mag"])
+            for header,seq in sfp(open(input["cont"])):
+                if header in circ:
+                    with open("%s/circ_%s.fa"%(folder,header),"w") as handle:
+                        handle.write(">%s\n%s\n"%(header,seq))
+            shell("touch {output}")
+else:
+    rule filter_circ_mags:
+        input: summary = "{path}/annotation/summary_0.99.tsv",
+               cont = "{path}/contigs/contigs.fa"
+        output: mag = "{path}/MAGs/mags/circ.done"
+        run:
+            # get list of circular mags
+            circ_contigs = [line.rstrip().split("\t") for line in open(input["summary"]) if line.rstrip().split()[0][-1]=="c"]
+            circ_mags = {contig for contig,uniq,comp,cont,nucsize in circ_contigs if float(uniq[:-1])>=75}
+
+            # output mag circ as independant mag :
+            folder = dirname(output["mag"])
+            for header,seq in sfp(open(input["cont"])):
+                if header in circ_mags:
+                    with open("%s/circ_%s.fa"%(folder,header),"w") as handle:
+                        handle.write(">%s\n%s\n"%(header,seq))
+            shell("touch {output}")
+
+
+
+# ------------ map long read to assembly ----------------
+rule minimap2:
+    input: contigs = "{path}/contigs/contigs.fa",
+           samples = lambda x:SAMPLES[x.sample]
+    output: "{path}/map_hifi/{sample}_mapped_sorted.bam"
+    log:"{path}/map_hifi/{sample}.log"
+    threads: 20
+    shell: "minimap2 -ax asm10 -I 100g -t {threads} {input.contigs} {input.samples} 2> {log} | samtools view  -b -F 4 -@{threads} - | samtools sort -@{threads} - > {output} "
+
+# rule bam_to_paf:
+#     input: '{path}.bam'
+#     output: '{path}.paf'
+#     shell: "samtools view -h {input} | paftools.js sam2paf - > {output}"
+
+# rule filter_paf:
+#     input: paf = expand("{{path}}/map_hifi/{sample}.paf",sample=SAMPLES)
+#     output: "{path}/profile/hifi_coverage.tsv"
+#     log:"{path}/map_hifi/cov.log"
+#     threads: 50
+#     shell: "{SCRIPTS2}/Minimap_Cov_Mean.py {graph.gfa} {input.paf} > {output}"
+ 
+# ------------ map long read to assembly ----------------
+rule bed_orfs:
+    input:   gff="{path}/contigs.gff"
+    output:  bed=temp("{path}/orf.bedtemp")
+    shell : "{SCRIPTS}/Gff_to_bed.py {input.gff} {output.bed}"
+
+rule cut_contigs:
+    input:  fa="{group}/contigs/contigs.fa",
+            gff="{group}/annotation/contigs.gff"
+    output: contig="{group}/contigs/contigs_C10K.fa",
+            Contig_bed=temp("{group}/annotation/contigs_C10K.bedtemp")
+    priority: 50
+    message:"Use orfs annotation to cut contigs"
+    shell:  """{SCRIPTS}/Use_orf_to_cut.py {input.fa} {input.gff} {output.contig} {output.Contig_bed}"""
+
+rule bogus_bed:
+    input:   contig="{group}/contigs/contigs.fa"
+    output:  bed=temp("{group}/annotation/contigs.bedtemp")
+    conda : CONDA_ENV + "/pythonenv.yaml"
+    singularity : "builds/pythonenv.sif"
+    shell : "{SCRIPTS}/bogus_bed.py -i {input.contig} -o {output.bed}"
+
+rule sort_bed:
+    input: bed = "{path}/annotation/{type}.bedtemp",
+           cont = "{path}/contigs/contigs.fa"
+    output: bed = "{path}/annotation/{type}.bed",
+            gfile = temp("{path}/annotation/{type}_bedtools_target_definition.tsv")
+    shell: "{SCRIPTS}/sort_bed.py {input.bed} {input.cont} {output.bed} -g {output.gfile}"
+
+
+# ---- use bedtool to compute coverage  ----------------------------------------------------
+rule bedtools:
+    input:   bam = "{group}/map_{read_type}/{sample_both}_mapped_sorted.bam",
+             bed = "{group}/annotation/{type}.bed",
+             genome = "{group}/annotation/{type}_bedtools_target_definition.tsv"
+    output:  "{group}/map_{read_type}/{sample_both}_{type}.cov"
+    log:      "{group}/map_{read_type}/{sample_both}_{type}.log"
+    shell:   "bedtools coverage -a {input.bed} -b {input.bam} -g {input.genome} -mean -sorted> {output} 2>{log} "
+
+
+rule coverage:
+    input: lambda w:expand("{{path}}/map_{{read_type}}/{sample}_{{type}}.cov",sample=READ_TYPE[w.read_type])
+    output:  "{path}/profile/coverage_{read_type}_{type}.tsv"
+    shell : "{SCRIPTS}/collate_coverage.py -o {output} -s _{wildcards.type}.cov -l {input}" 
+
+#--------- Concoct -----------
+def get_initial_number_of_bins(file):
+    nb_bin=int(2*np.median(list(Counter([header.split(" ")[1] for header,seq in sfp(open(file))]).values())))
+    return min(nb_bin,MAX_BIN_NB)
+
+
+# remove circular contigs from coverage before binning
+rule filter_circ_cont:
+    input: depth = "{path}/map_{read_type}/depth.txt",
+           cov = "{path}/profile/coverage_{read_type}_contigs_C10K.tsv",
+           bed = "{path}/annotation/contigs_C10K.bed",
+           circ = "{path}/MAGs/mags/circ.done"
+    output: depth = "{path}/map_{read_type}/no_circ_depth.txt",
+            cov = "{path}/profile/coverage_{read_type}_no_circ_C10K.tsv",
+    run:
+        circ = {header for file in glob.glob("%s/circ*.fa"%dirname(input["circ"])) for header,seq in sfp(open(file))}
+
+        # depth:
+        with open(input['depth']) as handle, open(output["depth"],"w") as handle_w:
+            for line in handle:
+                if line.rstrip().split("\t")[0] in circ:
+                    continue
+                handle_w.write(line)
+
+        # cov:
+        with open(input['cov']) as handle, open(output["cov"],"w") as handle_w:
+            nb_dots = {line.rstrip().split("\t")[0].count(".") for line in open(input["bed"])}
+            assert len(nb_dots)==1, "nb dots changes, there is more than one nb of dots in all contigs"
+            nb_dots = list(nb_dots)[0]
+            for line in handle:
+                cont = line.rstrip().split("\t")[0]
+                if cont.count(".")==nb_dots:
+                    contig = cont
+                else:
+                    contig = ".".join(cont.split(".")[:-1])
+                if contig in circ:
+                    continue
+                handle_w.write(line)
+
+rule concoct:
+    input:   cov="{group}/profile/coverage_{read_type}_no_circ_C10K.tsv",
+             fasta="{group}/contigs/contigs_C10K.fa",
+             SCG="{group}/annotation/contigs_SCG.fna"
+    output:  cluster="{group}/binning/concoct_{read_type}/clustering_gt"+str(MIN_CONTIG_SIZE)+".csv",
+             Data="{group}/binning/concoct_{read_type}/original_data_gt%d.csv"%MIN_CONTIG_SIZE
+    log: "{group}/binning/concoct_{read_type}/log.txt"
+    params:  min_contig_size=MIN_CONTIG_SIZE
+    threads: 20
+    # I don't want to use checkpoints, (buggy and increase DAG resolution time?) so I'll run the code inside a python run
+    run :
+        print(input["SCG"])
+        nb_bin_init = get_initial_number_of_bins(input["SCG"])
+        shell("concoct --coverage_file {input.cov} -i 1000 --composition_file {input.fasta} -b {wildcards.group}/binning/concoct -c %s -l {params.min_contig_size} -t {threads} &>> {log}"%nb_bin_init)
+
+
+# Get SCG cluster def
+rule scg_cluster_def:
+    input: clu = "{path}/contigs_0.99_mmseqs_cluster.tsv",
+           scg = "{path}/contigs_SCG.fna"
+    output: "{path}/SCG_cluster_0.99.tsv"
+    run:
+        # get orf to SCG
+        orf_to_scg = {header.split()[0]:header.split()[1] for header,_ in sfp(open(input["scg"]))}
+
+        # get clu def
+        orf_to_clu = defaultdict(lambda :defaultdict(list))
+        for line in open(input["clu"]):
+            rep,orf = line.rstrip().split("\t")
+            orf_to_clu[orf_to_scg[rep]][rep].append(orf)
+
+        # output
+        with open(output[0],"w") as handle:
+            handle.writelines("%s\t%s\t%s\n"%(cog,index,"\t".join(orfs)) for cog,clus in orf_to_clu.items() for index,(ref,orfs) in enumerate(clus.items()))
+
+# Get SCG table out of clustering
+rule SCG_table:
+    input  : bins="{group}/binning/{binner}/clustering_{name}.csv",
+             SCG="{group}/annotation/contigs_SCG.fna",
+             orf_bed="{group}/annotation/orf.bed",
+             split_bed="{group}/annotation/contigs_C10K.bed",
+             clu = "{group}/annotation/SCG_cluster_0.99.tsv"
+    output : "{group}/binning/{binner}/{name}_SCG_table.csv"
+    shell  : "{SCRIPTS}/SCG_in_Bins.py {input.bins} {input.SCG} {input.orf_bed} {input.split_bed} -t {output} -c {input.clu}"
+
+
+# Concoct refine
+rule refine:
+    input:  bins="{group}/binning/concoct_{read_type}/clustering_gt%d.csv"%MIN_CONTIG_SIZE,
+            table="{group}/binning/concoct_{read_type}/gt%d_SCG_table.csv"%MIN_CONTIG_SIZE,
+            SCG="{group}/annotation/contigs_SCG.fna",
+            Data="{group}/binning/concoct_{read_type}/original_data_gt%d.csv"%MIN_CONTIG_SIZE
+    output: bins="{group}/binning/concoct_{read_type}/clustering_refine.csv",
+    params: temp="{group}/binning/concoct_{read_type}/refine.temp",
+            path = "{group}/binning/concoct_{read_type}"
+    log:    temp("{group}/binning/concoct_{read_type}/clustering.log")
+    threads: 20
+    shell:  """
+            DATA=$(realpath {input.Data})
+            TABLE=$(realpath {input.table})
+            TEMP=$(realpath {params.temp})
+            LOG=$(realpath {log})
+            sed '1d' {input.bins} > $TEMP
+            cd {params.path}
+            concoct_refine $TEMP $DATA $TABLE -t {threads} &>>$LOG
+            rm $TEMP
+            """
+
+# merge back contigs
+rule merge_contigs:
+    input:   refine="{path}/concoct_{read_type}/clustering_refine.csv",
+             table ="{path}/concoct_{read_type}/refine_SCG_table.csv" 
+    output:  "{path}/concoct_{read_type}/clustering_concoct_{read_type}.csv"
+    log:     "{path}/concoct_{read_type}/clustering_consensus.log"
+    shell:   "{SCRIPTS}/Consensus.py {input.refine} >{output} 2>{log}"
+
+# estimate the number of mag
+rule output_number_of_mag:
+    input:   table="{path}/{binner}_SCG_table.csv"
+    output:  mag_nb="{path}/{binner}_MAG_nb.txt",
+             mag_list="{path}/{binner}_MAG_list.txt"
+    run:
+        with open(output["mag_nb"],"w") as handle_nb:
+            with open(output["mag_list"],"w") as handle_list:
+                nb=0
+                mags=[]
+                for index,line in enumerate(open(input["table"])) :
+                    if index==0:
+                        continue
+                    split_line=line.rstrip().split(',')
+                    if sum([element=="1" for element in split_line[1:]])>=(0.75*36) :
+                        nb+=1
+                        mags.append(split_line[0])
+                handle_nb.write(str(nb)+"\n")
+                handle_list.write("\n".join([nb for nb in mags]))
+
+
+#-- produce a contig file for each bins be they good or not (metabat2 style) --
+ruleorder : metabat2>output_bins
+rule output_bins:
+    input:   contigs="{group}/contigs/contigs.fa",
+             clustering="{group}/binning/{binner}/clustering_{binner}.csv"
+    output:  "{group}/binning/{binner}/bins/done"
+    shell :"""
+    {SCRIPTS}/Split_fasta_by_bin.py {input.clustering} $(dirname {output}) --fasta {input.contigs}
+    touch {output}
+    """
+
+# ------------ metabat2 ------------
+rule generate_depth :
+    input:  lambda w:expand("{{group}}/map_{{read_type}}/{sample}_mapped_sorted.bam",sample=READ_TYPE[w.read_type])
+    output: "{group}/map_{read_type}/depth.txt"
+    log : "{group}/map_{read_type}/depth.log"
+    shell: "jgi_summarize_bam_contig_depths --outputDepth {output} {input} &>{log}" 
+
+rule metabat2 :
+    input:  contig="{group}/contigs/contigs.fa",
+            depth="{group}/map_{read_type}/no_circ_depth.txt"
+    output: "{group}/binning/metabat2_{read_type}/bins/done"
+    params: out="{group}/binning/metabat2_{read_type}/bins/bin",
+            min_contig_size=max(1500,MIN_CONTIG_SIZE_METABAT2) # metabat2 does not bin anything smaller than 1500
+    threads : 20
+    shell: """metabat2 -i {input.contig} -a {input.depth} -t {threads} -o {params.out} -m {params.min_contig_size}
+            touch {output}
+            """
+
+rule renames_metabat2_bins :
+    input: "{group}/binning/metabat2_{read_type}/bins/done"
+    output:"{group}/binning/metabat2_{read_type}/bins/name_done"
+    run:
+        List_bins=glob.glob(wildcards.group+"/binning/metabat2_%s/bins/bin*.fa"%wildcards.read_type)
+        for bin_ in List_bins:
+            new_name=bin_.replace("bin.","Bin_")
+            os.system("mv %s %s"%(bin_,new_name))
+        os.system("touch %s"%output)
+
+rule post_processing :
+    input: "{group}/binning/metabat2_{read_type}/bins/name_done"
+    output:"{group}/binning/metabat2_{read_type}/clustering_metabat2_{read_type}.csv"
+    run:
+        List_bins=glob.glob(wildcards.group+"/binning/metabat2_%s/bins/Bin*.fa"%wildcards.read_type)
+        Handle=open(output[0],"w")
+        Handle.write("contig_id,0\n")
+        for file in List_bins :
+            bin_name=file.split("Bin_")[-1].split('.fa')[0]
+            for name,seq in sfp(open(file)) :
+                Handle.write(",".join([name,bin_name])+"\n")
+        Handle.close()
+
+
+#------ create a consensus binning between concoct and metabat2 ------
+rule get_consensus_binning :
+    # only support 2 binner as of now
+    input : c_bin_def = "{group}/binning/concoct_{read_type}/clustering_concoct_{read_type}.csv",
+            m_bin_def = "{group}/binning/metabat2_{read_type}/clustering_metabat2_{read_type}.csv",
+            c_mag_list = "{group}/binning/concoct_{read_type}/concoct_{read_type}_MAG_list.txt",
+            m_mag_list = "{group}/binning/metabat2_{read_type}/metabat2_{read_type}_MAG_list.txt",
+            scg = "{group}/annotation/contigs_SCG.fna",
+            contig_profiles = "{group}/binning/concoct_{read_type}/original_data_gt%s.csv"%MIN_CONTIG_SIZE,
+            contig_bed = "{group}/annotation/contigs.bed"
+    output : "{group}/binning/consensus_{read_type}/clustering_consensus_{read_type}.csv"
+    shell :"""
+    {SCRIPTS}/consensus_binning.py -c_bin_def {input.c_bin_def} -m_bin_def {input.m_bin_def} -c_mag_list {input.c_mag_list} -m_mag_list {input.m_mag_list} -scg {input.scg} -contig_profiles {input.contig_profiles} -contig_bed {input.contig_bed} -o {output}
+    """
+
+rule nb_nuc_hifi:
+    output: temp("{path}/profile/{sample}_hifi_nb_nuc.tsv")
+    params: lambda x:SAMPLES[x.sample]
+    shell: "seqtk fqchk {params}| grep ALL | cut -f2 > {output}"
+
+rule nb_nuc_sr:
+    output: temp("{path}/profile/{sample_sr}_sr_nb_nuc.tsv")
+    params: R1 = lambda x:R1[x.sample_sr],
+            R2 = lambda x:R2[x.sample_sr],
+    shell: "expr $(seqtk fqchk {params.R1} | grep ALL | cut -f2) + $(seqtk fqchk {params.R2} | grep ALL | cut -f2) > {output}"
+
+rule create_normalisation:
+    input:  lambda w:expand("{{path}}/profile/{sample}_{{read_type}}_nb_nuc.tsv",sample=READ_TYPE[w.read_type])
+    output: "{path}/profile/Normalisation_{read_type}.tsv"
+    run:
+        samples_nuc = {}
+        samples = READ_TYPE[wildcards["read_type"]]
+        for sample in samples:
+            file = "%s/profile/%s_%s_nb_nuc.tsv"%(ROOT,sample,wildcards.read_type)
+            samples_nuc[sample] = int(next(open(file)).rstrip())
+        sorted_samples = sorted(samples_nuc.keys())
+        with open(output[0],"w") as handle:
+            handle.write("Normalisation\t%s\n"%"\t".join(sorted_samples))
+            handle.write("Nucleotides\t%s\n"%("\t".join([str(samples_nuc[sample]) for sample in sorted_samples])))
+            handle.write("median_scg\t%s\n"%("\t".join(["0" for sample in sorted_samples])))
+
+
+rule mag_coverage:
+    input: mags="{group}/binning/{binR}_{read_type}/{binR}_{read_type}_MAG_list.txt",
+           cluster="{group}/binning/{binR}_{read_type}/clustering_{binR}_{read_type}.csv",
+           cov="{group}/profile/coverage_{read_type}_contigs.tsv",
+           len="{group}/annotation/contigs.bed",
+           nb_nuc="{group}/profile/Normalisation_{read_type}.tsv"
+    output: mag_cov="{group}/profile/mag_{binR}_{read_type}_coverage.tsv",
+            mag_map="{group}/profile/mag_{binR}_{read_type}_percent_mapped.tsv"
+    shell:"""
+    {SCRIPTS}/mag_coverage.py -m {input.mags} -c {input.cluster} -t {input.cov} -l {input.len} -n {input.nb_nuc} -v {output.mag_cov} -p {output.mag_map}
+    """
+
+
+
+
+# ----------- run gtdb ----------------------
+
+rule mag_directory:
+    input: clustering = "{path}/binning/{binner}/clustering_{binner}.csv",
+           assembly = "{path}/contigs/contigs.fa",
+           mag_list = "{path}/binning/{binner}/{binner}_MAG_nb.txt"
+    output: mags = "{path}/MAGs/mags/{binner}.done"
+    shell: """
+           {STR_SCRIPTS}/Split_fasta_by_bin.py {input.assembly} {input.clustering} $(dirname {output})
+           touch {output}
+           """
+
+rule gtdb :
+    input : "{path}/mags/consensus_{read_type}.done"
+    output : "{path}/gtdb_{read_type}/gtdbtk.ar122.classify.tree"
+    threads : 50
+    shell : """
+    gtdbtk classify_wf --cpus {threads} --genome_dir $(dirname {input}) --out_dir $(dirname {output}) --extension .fa
+    touch {output}
+    """
+
+# ---------- orf graph annotation -----------------
+
+rule orf_graph:
+    input: gfa="/mnt/gpfs/chris/repos2/hifiasm-meta/asm_temp/asm_ad21_w20/asm.p_ctg.gfa",
+           bed="{path}/graph_bed.bed"
+    output:temp("{path}/annotated_graph.gfa.full")
+    shell:"{SCRIPTS}/Build_ORF_graph.py {input.bed} {input.gfa} {output}"
+
+rule remove_seq:
+    input: gfa="{path}/annotated_graph.gfa.full",
+    output: gfa="{path}/annotated_graph.gfa"
+    run:
+        with open(output["gfa"],"w") as handle:
+            for line in open(input["gfa"]):
+                if line[0]=="S":
+                    split = line.rstrip().split("\t")
+                    handle.write("%s\n"%"\t".join(split[:2]+["*"]+split[3:]))
+                else:
+                    handle.write(line)
+
+rule scg_graph:
+    input: clu = "{path}/binning/{binner}/clustering_{binner}.csv",
+    output: color = '{path}/graph/{binner}_color.csv',
+    run:
+        # get contigs to bin
+        contig_bin = {line.rstrip().split(",")[0]:line.rstrip().split(",")[1] for index,line in enumerate(open(input["clu"])) if index>0}
+        sorted_bins = sorted(contig_bin.values())
+
+        # colors
+        color_scheme = ["#0075DC","#FFCC99", "#2BCE48", "#F0A3FF", "#993F00", "#4C005C", "#808080", "#94FFB5", "#8F7C00", "#9DCC00","#C20088", "#003380", "#FFA405", "#FFA8BB", "#426600", "#FF0010", "#5EF1F2", "#00998F", "#740AFF", "#990000", "#FFFF00"]
+        bin_color = {Bin:color_scheme[index%len(color_scheme)] for index,Bin in enumerate(sorted_bins)}
+        contig_color = {contig:bin_color[Bin] for contig,Bin in contig_bin.items()}
+
+        # output colors
+        with open(output["color"],"w") as handle:
+            handle.write("Node,Colour,Bin\n")
+            handle.writelines("%s,%s,%s\n"%(contig,contig_color[contig],Bin) for contig,Bin in contig_bin.items())
+
+
+# --------------------------------------------------------------------------------------
+# ------------------------------------ short reads -------------------------------------
+# --------------------------------------------------------------------------------------
+
+rule bwa_index:
+    input:   "{path}/contigs.fa"
+    output:  "{path}/contigs.fa.sa"
+    log: "{path}/index.log"
+    params : 100000000000
+    message: "Building bwa index for {input}"
+    shell:   "bwa index -b {params} {input} &> {log}"
+
+# ---- map reads to the assembly contigs 
+rule bwa_mem_to_bam:
+    input:   index="{group}/contigs/contigs.fa.sa",
+             contigs="{group}/contigs/contigs.fa",
+             R1 = lambda w:R1[w.sample_sr],
+             R2 = lambda w:R2[w.sample_sr]
+    output:  "{group}/map_sr/{sample_sr}_mapped_sorted.bam"
+    threads: 100
+    log:     "{group}/map_sr/{sample_sr}_map.log"
+    shell:   "bwa mem -t {threads} {input.contigs} {input.R1} {input.R2} 2>{log} | samtools view  -b -F 4 -@{threads} - | samtools sort -@{threads} - > {output}"
+
+
+
+# --------------------------------------------------------------------------------------
+# ----------------------------- optional/in_dev stuff ----------------------------------
+# --------------------------------------------------------------------------------------
+
+# ------------------ test nb of ambiguous short reads -----------------
+rule ambiguous_short_reads:
+    input:   bam = "{path}/map_sr/{sample_sr}_mapped_sorted.bam"
+    output: reads_nb = "{path}/map_sr/{sample_sr}_mapped_read.txt",
+            nb_unique = "{path}/map_sr/{sample_sr}_unique_reads_nb.txt"
+    params: bam_unique = "{path}/map_sr/{sample_sr}_unique.bam",
+    threads: 8
+    run:  
+        shell("samtools view -h {input.bam} -@ {threads} | grep -v -e 'XA:Z:'  | samtools view -b -@ {threads} > {params.bam_unique}")
+        shell("samtools flagstat {input.bam} -@ {threads} | grep 'paired in sequencing' | cut -f1 -d " " > {output.reads_nb}")
+        shell("samtools flagstat {params.bam_unique} -@ {threads} | grep 'paired in sequencing' | cut -f1 -d " " > {output.nb_unique}")
+
+        # once this is done, go get the info of contigs with multimap reads
+        samfile = pysam.AlignmentFile(input["bam"], "rb")
+        for line in samfile :
+            if line.has_tag("XA"):
+                read_name = line.qname+"/"+line.is_read1*"1"+line.is_read2*"2"
+                # alt_al = (contig,pos,cigar,NM)
+                nb_match = lambda cigar:sum([int(el) for el in re.findall("(\d+)M",cigar)])
+                # al_len = lambda cigar:sum([int(el) for el in re.findall("(\d+)",cigar)])
+                alternatives = [[alt_al.split(",")[0],nb_match(alt_al.split(",")[2])] for alt_al in line.get_tag("XA")[:-1].split(";")]+[[samfile.getrname(line.reference_id),nb_match(line.cigarstring)]]
+                read_to_contig[read_name].append(alternatives)
+
+        samfile.close()
+        # if a read map differently to the contig, keep the best one (nb matches)
+        read_to_contig2={}
+        for read,matches in read_to_contig.items() : 
+            contig_matches=defaultdict(list)
+            for contig,match in matches :
+                contig_matches[contig].append(match)
+            new_matches = [[contig,max(matches)] for contig,matches in contig_matches.items()]
+            read_to_contig2[read] = new_matches
+        with open(output["ambiguous"],'w') as handle : 
+            handle.write("\n".join(['\t'.join([read]+[";".join(map(str,el)) for el in matches]) for read,matches in read_to_contig2.items()])+"\n")
+
+
+
+rule percent_ambiguity:
+    input: files = expand("{{path}}/map_sr/{sample_sr}_unique_reads_nb.txt",sample_sr=R1),
+           files2 = expand("{{path}}/map_sr/{sample_sr}_mapped_read.txt",sample_sr=R1)
+    output: out = "{path}/profile/percent_ambiguous_sr.tsv"
+    run:
+        sample_to_unique_mapped = {basename(file.replace("_unique_mapped_read.txt","")):float(open(file).read().rstrip()) for file in input["files"]}
+        sample_to_mapped = {basename(file.replace("_mapped_read.txt","")):float(open(file).read().rstrip()) for file in input["files2"]}
+        sorted_samples = sorted(sample_to_mapped.keys())
+        with open(output["out"],"w") as handle:
+            handle.write("samples\tmapped_reads\tunambiguous_mapped_reads\tpercent_unambiguous_mapped_reads\n")
+            handle.writelines("%s\t%s\n"%(sample,sample_to_mapped[sample],sample_to_unique_mapped[sample],sample_to_unique_mapped[sample]/sample_to_mapped[sample]) for sample in sorted_samples)
+
+# ------------------ test nb of ambiguous long reads -----------------
+
+# doc on read ambiguity:
+# if using minimap2, 
+#     in minimap2, best hit is not the only alignment outputed, instead lots of secondary have an AS whithin the asm setting chosen, that mean that if you look at mapq>0 nothing is left
+#     in minimap2, tp is either P(primary)/S(secondary)/I(inversion)
+#     in minimap2, AS gives alignment score
+#     What is unclear is if minimap2 alignemnt outputed are all secondary or if some are written as supllementary while being quite not as good as primary instead of being equivalent
+#     I saw at least 1 example of 1 read mapped as primary to multiple location, possibly a multi-index shenanigan due to file being too big. Don't do index kid.
+#     So, recomended method is: 
+#         use AS to find the best hit and what I consider "True" secondary, same AS but different Alignment
+#         should ouput ambiguous contigs: contigs linkage done by reads
+#         should repeat that using this time the setting of, for instance anvio or minimpa2
+# if using bwa mem,
+#     In bwa mem, by default secondary al are not outputed, instead they are flagged using a tag, tag XA
+#     So, recomended method is:
+#         parse 
+
+
+# quick reminder:
+#     supplementary: reads mapped in a non linear fashion, gap, reverse, splits, flag (2048)
+#     secondary: alignment where there is already another alignment for the read. In minimap2, things with a distance of best alignment score (quality, not probability) are kept. This is to ensure that we can deal with noise? flag (256)
+
+
+rule ambiguous_long_reads:
+    input:   bam = "{path}/map_hifi/{sample}_mapped_sorted.bam",
+             bai = "{path}/map_hifi/{sample}_mapped_sorted.bam.bai"
+    output: reads_nb = "{path}/map_hifi/{sample}_mapped_read.txt",
+            nb_unique = "{path}/map_hifi/{sample}_unique_reads_nb.txt"
+    run:
+        samfile = pysam.AlignmentFile(input["bam"], "rb")
+        for line in samfile :
+            read_to_contig[line.qname].append([line.reference_name,line.mapq,line.get_tag("AS")])
+        # compute 
+
+
+
+# rule ambiguous_short_reads:
+#     input:   bam = "{path}/map_sr/{sample_sr}_mapped_sorted.bam",
+#              bai = "{path}/map_sr/{sample_sr}_mapped_sorted.bam.bai"
+#     output: reads_nb = "{path}/map_sr/{sample_sr}_mapped_read.txt",
+#             nb_unique = "{path}/map_sr/{sample_sr}_unique_reads_nb.txt"
+#     params: bam_unique = "{path}/map_sr/{sample_sr}_unique.bam",
+#     threads: 8
+#     run:  
+#         shell("samtools view -h {input.bam} -@ {threads} | grep -v -e 'XA:Z:'  | samtools view -b -@ {threads} > {params.bam_unique}")
+#         shell("samtools flagstat {input.bam} -@ {threads} | grep 'paired in sequencing' | cut -f1 -d " " > {output.reads_nb}")
+#         shell("samtools flagstat {params.bam_unique} -@ {threads} | grep 'paired in sequencing' | cut -f1 -d " " > {output.nb_unique}")
+
+#         # once this is done, go get the info of contigs with multimap reads
+#         samfile = pysam.AlignmentFile(input["bam"], "rb")
+#         for line in samfile :
+#             if line.has_tag("XA"):
+#                 read_name = line.qname+"/"+line.is_read1*"1"+line.is_read2*"2"
+#                 # alt_al = (contig,pos,cigar,NM)
+#                 nb_match = lambda cigar:sum([int(el) for el in re.findall("(\d+)M",cigar)])
+#                 # al_len = lambda cigar:sum([int(el) for el in re.findall("(\d+)",cigar)])
+#                 alternatives = [[alt_al.split(",")[0],nb_match(alt_al.split(",")[2])] for alt_al in line.get_tag("XA")[:-1].split(";")]+[[samfile.getrname(line.reference_id),nb_match(line.cigarstring)]]
+#                 read_to_contig[read_name].append(alternatives)
+
+#         samfile.close()
+#         # if a read map differently to the contig, keep the best one (nb matches)
+#         read_to_contig2={}
+#         for read,matches in read_to_contig.items() : 
+#             contig_matches=defaultdict(list)
+#             for contig,match in matches :
+#                 contig_matches[contig].append(match)
+#             new_matches = [[contig,max(matches)] for contig,matches in contig_matches.items()]
+#             read_to_contig2[read] = new_matches
+#         with open(output["ambiguous"],'w') as handle : 
+#             handle.write("\n".join(['\t'.join([read]+[";".join(map(str,el)) for el in matches]) for read,matches in read_to_contig2.items()])+"\n")
+
+
+
+
+        # samfile = pysam.AlignmentFile(input["bam"], "rb")
+
+
+
+        
+        # # What is unclear is if bwa mem output all secondary alignment, so keep on using XA tag to be sure
+        #  read_to_contig = defaultdict(list)
+        # for line in samfile :
+        #     read_to_contig[line.qname].append(line)
+
+        # # short reads counts number of reads
+        # reads_nb = 0
+        # for read,al in read_to_contig.items():
+        #     nb = [0,0]
+        #     for a in al:
+        #         if a.is_read1:
+        #             nb[0]=1
+        #         if a.is_read1:
+        #             nb[1]=1
+        #     reads_nb+=sum(nb)
+
+        # hist = Counter(map(len,read_to_contig.values()))
+
+        # read_to_contig2 = {read:als for read,als in read_to_contig.items() if sum([al.has_tag("XA") for al in als])>0}
+            
+        # hist2 = Counter(map(len,read_to_contig2.values()))
+
+        # # try strict definition of secondary: exact same alignment quality:
+        # read_to_contig2 = {read:[el for el in als if el.get_tag("AS")==max([e.get_tag("AS") for e in als])] for read,als in read_to_contig.items()}
+        # hist2 = Counter(map(len,read_to_contig2.values()))
+        # read_to_contig3 = {read:[al for al in als if al.mapq!=0] for read,als in read_to_contig2.items() if max([a.mapq for a in als])==0}
+        # hist3 = Counter(map(len,read_to_contig2.values()))
+
+        # read_to_contig[line.qname].append(line)
+
+        # [al.get_tag("tp") for al in read_to_contig[Ten_als[0]]]
+        # mult_al = [read for read,als in read_to_contig2.items() if len(als)==10]
+        # for al in read_to_contig[mult_al[2]]:
+        #     print(al.is_read1,al.mapq,al.get_tag("AS"),al.qstart,al.qend,al.qname,al.rname,al.reference_start,al.reference_end,al.alen)
+        #     if al.has_tag("XA"):
+        #         print(al.get_tag("XA"))
+
+        #     print(al.mapq,al.get_tag("tp"),al.get_tag("AS"),al.get_tag("ms"),al.qstart,al.qend,al.qname,al.rname,al.reference_start,al.reference_end,al.alen)
+
+
+        # # Look at how consistent AS is between secondary
+
+
+
+        #     if line.has_tag("XA") :
+        #         read_name = line.qname+"/"+line.is_read1*"1"+line.is_read2*"2"
+        #         # alt_al = (contig,pos,cigar,NM)
+        #         nb_match = lambda cigar:sum([int(el) for el in re.findall("(\d+)M",cigar)])
+        #         # al_len = lambda cigar:sum([int(el) for el in re.findall("(\d+)",cigar)])
+        #         alternatives = [[alt_al.split(",")[0],nb_match(alt_al.split(",")[2])] for alt_al in line.get_tag("XA")[:-1].split(";")]+[[samfile.getrname(line.reference_id),nb_match(line.cigarstring)]]
+        #         read_to_contig[read_name].append(alternatives)
+
+        # samfile.close()
+        # # if a read map differently to the contig, keep the best one (nb matches)
+        # read_to_contig2={}
+        # for read,matches in read_to_contig.items() : 
+        #     contig_matches=defaultdict(list)
+        #     for contig,match in matches :
+        #         contig_matches[contig].append(match)
+        #     new_matches = [[contig,max(matches)] for contig,matches in contig_matches.items()]
+        #     read_to_contig2[read] = new_matches
+        # with open(output["ambiguous"],'w') as handle : 
+        #     handle.write("\n".join(['\t'.join([read]+[";".join(map(str,el)) for el in matches]) for read,matches in read_to_contig2.items()])+"\n")
+        # # samtools + grep is faster at this : main overhead is reading/writing which can be easily parralellised with samtool
+        # shell("samtools view -h {input} -@ {threads} | grep -v -e 'XA:Z:'  | samtools view -b -@ {threads} > {output.unique}")
+
+rule mapped_reads:
+    input:  bam="{path}_unique.bam"
+    output: readnb="{path}_unique_mapped_read.txt"
+    threads:THREADS
+    shell: """samtools flagstat {input.bam} -@ {threads} | grep 'paired in sequencing' | cut -f1 -d " " > {output.readnb}""" 
+
+
+
+# ------------------ check if we can improve read mapping and binning using kallisto -----------------
+#-------kallisto ------------
+
+# rule kallisto     
+rule index_sequences : 
+    input :  "{path}/contigs/contigs.fa",
+    output : "{path}/kallisto_map/kallisto.index"
+    shell : "kallisto index -i {output} {input}"
+
+rule quantification : 
+    input : samples = lambda w : SAMPLES[w.sample],
+            index = "{path}/kallisto_map/kallisto.index"
+    output : cov = "{path}/kallisto_map/{sample}/abundance.tsv"
+    params: l = lambda w:KALLISTO_STATS[w.sample][0],
+            s = lambda w:KALLISTO_STATS[w.sample][1],
+    threads : 20
+    shell : "kallisto quant -i {input.index} -l {params.l} -s {params.s} --single -o $(dirname {output}) {input.samples} -t {threads}"
+
+
+def matrix_write(matrix,file_name,col_names,row_names) :
+    with open(file_name,"w") as handle:
+        handle.write("/\t%s\n"%"\t".join(col_names))
+        handle.writelines('%s\t%s\n'%(row_names[index],"\t".join(["{:.4g}".format(el) for el in line])) for index,line in enumerate(matrix))
+
+
+rule get_coverage : 
+    input : samples = expand("{{path}}/kallisto_map/{sample}/abundance.tsv",sample = SAMPLES),
+            contigs = "{path}/contigs/contigs_C10K.fa"
+    output : cov = "{path}/profile/kallisto_coverage_contigs_C10K.tsv",
+    run :
+        # get genome effective genome length 
+        READ_LEN = 150
+        # effective length is calculated by taking the number of position a fragment of 2*READ_LEN size could be generated from, in a contig.
+        contig_to_len = {header:(len(seq)-2*READ_LEN) for header,seq in sfp(open(input["contigs"]))}
+        # get sorted row and column  
+        sorted_files = sorted(input["samples"])
+        sorted_samples = [basename(dirname(file)) for file in sorted_files]
+        sorted_contigs = sorted(contig_to_len.keys())
+        contigs_to_index = {contig:index for index,contig in enumerate(sorted_contigs)}
+
+        # pretty sure this is the most ineficient way of doing it.
+        K_covs = np.zeros((len(sorted_contigs),len(sorted_samples)))
+
+        for col_index,file in enumerate(sorted_files) :
+            with open(file) as handle:
+                _ = next(handle)
+                for line in handle:
+                    splitline = line.rstrip().split("\t")
+                    K_covs[contigs_to_index[splitline[0]],col_index]=2*READ_LEN*float(splitline[3])/contig_to_len[splitline[0]]
+        # output
+        matrix_write(K_covs,output["cov"],sorted_samples,sorted_contigs)
+
+
+
+rule kalisto_concoct:
+    input:   cov="{group}/profile/kallisto_coverage_contigs_C10K.tsv",
+             fasta="{group}/contigs/contigs_C10K.fa",
+             SCG="{group}/annotation/contigs_SCG.fna"
+    output:  cluster="{group}/binning/kallisto_concoct/clustering_gt"+str(MIN_CONTIG_SIZE)+".csv",
+             Data="{group}/binning/kallisto_concoct/original_data_gt%d.csv"%MIN_CONTIG_SIZE
+    log: "{group}/binning/kallisto_concoct/log.txt"
+    params:  min_contig_size=MIN_CONTIG_SIZE
+    threads: 20
+    # I don't want to use checkpoints, (buggy and increase DAG resolution time?) so I'll run the code inside a python run
+    run :
+        print(input["SCG"])
+        nb_bin_init = get_initial_number_of_bins(input["SCG"])
+        shell("concoct --coverage_file {input.cov} -i 1000 --composition_file {input.fasta} -b {wildcards.group}/binning/kallisto_concoct -c %s -l {params.min_contig_size} -t {threads} &>> {log}"%nb_bin_init)
+
+
+
+
+rule merge_contigs2:
+    input:   refine="{path}/binning/kallisto_concoct/clustering_refine.csv",
+             table ="{path}/binning/kallisto_concoct/refine_SCG_table.csv" 
+    output:  "{path}/binning/kallisto_concoct/clustering_kallisto_concoct.csv"
+    log:     "{path}/binning/kallisto_concoct/clustering_consensus.log"
+    shell:   "{SCRIPTS}/Consensus.py {input.refine} >{output} 2>{log}"
+
+
+rule refine_kallisto:
+    input:  bins="{group}/binning/kallisto_concoct/clustering_gt%d.csv"%MIN_CONTIG_SIZE,
+            table="{group}/binning/kallisto_concoct/gt%d_SCG_table.csv"%MIN_CONTIG_SIZE,
+            SCG="{group}/annotation/contigs_SCG.fna",
+            Data="{group}/binning/kallisto_concoct/original_data_gt%d.csv"%MIN_CONTIG_SIZE
+    output: bins="{group}/binning/kallisto_concoct/clustering_refine.csv",
+    params: temp="{group}/binning/kallisto_concoct/refine.temp",
+            path = "{group}/binning/kallisto_concoct"
+    log:    temp("{group}/binning/kallisto_concoct/clustering.log")
+    threads: 20
+    shell:  """
+            DATA=$(realpath {input.Data})
+            TABLE=$(realpath {input.table})
+            TEMP=$(realpath {params.temp})
+            LOG=$(realpath {log})
+            sed '1d' {input.bins} > $TEMP
+            cd {params.path}
+            concoct_refine $TEMP $DATA $TABLE -t {threads} &>>$LOG
+            rm $TEMP
+            """
+
+rule get_kallisto_consensus :
+    # only support 2 binner as of now
+    input : c_bin_def = "{group}/binning/kallisto_concoct/clustering_kallisto_concoct.csv",
+            m_bin_def = "{group}/binning/metabat2/clustering_metabat2.csv",
+            c_mag_list = "{group}/binning/kallisto_concoct/concoct_MAG_list.txt",
+            m_mag_list = "{group}/binning/metabat2/metabat2_MAG_list.txt",
+            scg = "{group}/annotation/contigs_SCG.fna",
+            contig_profiles = "{group}/binning/kallisto_concoct/original_data_gt%s.csv"%MIN_CONTIG_SIZE,
+            contig_bed = "{group}/annotation/contigs.bed"
+    output : "{group}/binning/kallisto_consensus/clustering_kallisto_consensus.csv"
+    shell :"""
+    {SCRIPTS}/consensus_binning.py -c_bin_def {input.c_bin_def} -m_bin_def {input.m_bin_def} -c_mag_list {input.c_mag_list} -m_mag_list {input.m_mag_list} -scg {input.scg} -contig_profiles {input.contig_profiles} -contig_bed {input.contig_bed} -o {output}
+    """
+
+# --------------------- and now something completely differetn ------------------
+
+# ----- run antisamsh
+
+# from Bio import SeqIO
+# from Bio.Alphabet import generic_dna
+# from BCBio import GFF
+
+rule assembly_to_genbank:
+    input: fa = "{path}/contigs/contigs.fa",
+           gff = "{path}/annotation/contigs.gff"
+    output: "{path}/contigs/contigs.gbk"
+    run:
+        fasta_input = SeqIO.to_dict(SeqIO.parse(input["fa"], "fasta", generic_dna))
+        gff_iter = GFF.parse(input["gff"], fasta_input)
+        SeqIO.write(gff_iter, output[0], "genbank")
+
+
+ANTISMASH_ENV = "/mnt/gpfs/seb/Applications/miniconda3/envs/antismash" 
+rule antiSmash:
+    input: contigs = "{path}/contigs/contigs.gbk",
+    output: "{path}/antiSmash/done"
+    threads: 100
+    shell: """
+           set +eu
+           source activate {ANTISMASH_ENV}
+           set -eu
+           antismash {input} -c {threads} --cb-general --cb-knownclusters --cb-subclusters --asf --pfam2go --smcog-trees --output-dir $(dirname {output})
+           touch {output}
+           """
+
+
+
