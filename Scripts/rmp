@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+from os.path import isfile, basename, isdir, islink, realpath
+from collections import defaultdict, Counter
+from multiprocessing import Pool
+import argparse
+import shutil
+import glob
+import time
+import sys
+import os 
+
+
+
+def get_files(cwd):
+    dirs = []
+    files = []
+    ignore = {"%s/."%cwd,"%s/.."%cwd}
+    for el in glob.glob("%s/*"%cwd):
+        if isdir(el)&( not islink(el)):
+            dirs.append(el)
+        else:
+            files.append(el)
+    for el in glob.glob("%s/.*"%cwd):
+        if el in ignore:
+            continue
+        if isdir(el)&( not islink(el)):
+            dirs.append(el)
+        else:
+            files.append(el)
+    return dirs,files
+
+def parallel_list_files(cwd,threads):
+    pool = Pool(threads)
+    dirs,files = get_files(cwd)
+    while dirs:
+        res = pool.map(get_files,dirs)
+        dirs = []
+        for _dirs,_files in res:
+            files += _files
+            dirs += _dirs
+    del pool
+    return files
+
+def parallel_list_folder(cwd,threads):
+    pool = Pool(threads)
+    files = []
+    dirs,files = get_files(cwd)
+    dir_to_cnt = defaultdict(int)
+    dir_to_parent = defaultdict(list)
+    for d in dirs:
+        dir_to_parent[d] = [cwd]
+        dir_to_cnt[cwd] = len(dirs)
+    while dirs:
+        res = pool.map(get_files,dirs)
+        new_dir = []
+        for index,(_dirs,_files) in enumerate(res):
+            nb_dirs = len(_dirs)
+            parent = dirs[index]
+            if _dirs:
+                new_dir += _dirs
+                new_parents = dir_to_parent[parent]+[parent]
+                for d in _dirs:
+                    dir_to_parent[d] = new_parents
+            dir_to_cnt[parent] += nb_dirs
+            for p in dir_to_parent[parent]:
+                dir_to_cnt[p]+=nb_dirs
+            files += _files
+        dirs = new_dir
+    del pool
+    return files, dir_to_cnt, dir_to_parent
+
+
+
+def parallel_rm_folders(cwd, threads, dir_to_cnt, dir_to_parent):
+    dir_to_parent = {key:set(val) for key,val in dir_to_parent.items()}
+    while dir_to_parent:
+        to_del = set()
+        for el in dir_to_parent:
+            if el in dir_to_cnt:
+                continue
+            if dir_to_parent[el]&to_del:
+                continue
+            to_del.add(el)
+        
+        # sort/batchs (sligh load averaging)
+        batch_size = 20
+        step = int(len(to_del)/float(batch_size))+1
+        to_del2 = list(to_del)
+        batchs = [to_del2[i::step] for i in range(step)]
+
+        # rm folder
+        pool = Pool(threads)
+        _ = pool.map(rm_folders,batchs)
+        del pool
+
+        # update
+        for child in to_del:
+            for p in dir_to_parent[child]:
+                dir_to_cnt[p]-=1
+        dir_to_cnt = {key:val for key,val in dir_to_cnt.items() if key not in to_del if val>=1}
+        dir_to_parent = {key:val for key,val in dir_to_parent.items() if key not in to_del}
+        print(len(dir_to_parent),len(to_del))
+
+
+
+
+
+def rm_files(files):
+    for f in files:
+        os.remove(f)
+    # better than other line since it can delete filse with dollar in it 
+    # os.remove('rm %s'%(" ".join(files)))
+
+def rm_folders(dirs):
+    for d in dirs:
+        os.rmdir(d)
+
+
+def rmp(root, threads, justlisting):
+    root = realpath(root)
+    # list things to del
+    start = time.time()
+    files, dir_to_cnt, dir_to_parent = parallel_list_folder(root,threads)
+    NB = len(files)
+
+    if justlisting:
+        print("listing file done (%s s)----- \n %s files\n %s folders\n\n\tbye now ~"%(int(time.time()-start),NB,len(dir_to_parent)))        
+        sys.exit(0)
+
+    # remove files
+    print("listing file done (%s s)----- now removing %s files"%(int(time.time()-start),NB))
+    start = time.time()
+    batch_size = 20
+    batchs = [files[i*batch_size:(i+1)*batch_size] for i in range(int(NB/float(batch_size))+1)]
+    pool = Pool(threads)
+    _ = pool.map(rm_files,batchs)
+    del pool
+
+    # remove folders
+    print("removing files done (%s s)----- now removing %s folders"%(int(time.time()-start),len(dir_to_parent)))
+    start = time.time()
+    parallel_rm_folders(root,threads,dir_to_cnt, dir_to_parent)
+    print("done (%s s) ---- \n\n\t bye now ~\n\n "%(int(time.time()-start)))
+
+    # remove root
+    os.system("rm -r %s"%root)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("to_del", help="folder to remove")
+    parser.add_argument("threads", help="nb threads",default=10)
+    parser.add_argument("-l", help="just list file instead of removing stuff",action='store_true',default=False)
+    args = parser.parse_args()
+    rmp(args.to_del,int(args.threads),args.l)

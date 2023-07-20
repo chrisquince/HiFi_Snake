@@ -1,0 +1,39 @@
+#!/usr/bin/env python
+from os.path import isfile, basename, isdir
+import argparse
+import glob
+import sys
+import os 
+
+def symlink(_from,_to):
+	if not isfile(_from):
+		if not isdir(_from):
+			# for regex selection of multiple folder
+			for el in glob.glob(_from):
+				symlink(el,"%s/%s"%(_to,basename(el)))
+		else:
+			if not isdir(_to):
+				os.system('mkdir -p %s'%_to)
+			for file in glob.glob("%s/*"%_from):
+				if isfile(file):
+					os.system("ln -s %s %s/"%(file,_to))
+				else:
+					new_dir = "%s/%s"%(_to,basename(file))
+					os.system('mkdir -p %s'%new_dir)
+					symlink(file,new_dir)
+	else:
+		os.system("ln -s %s %s/"%(_from,_to))
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("origin", help="folder of origin")    
+    parser.add_argument("destination", help="path to destination")
+    args = parser.parse_args()
+    symlink(args.origin,args.destination)
+
+    
+
+
+

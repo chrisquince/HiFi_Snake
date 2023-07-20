@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+from os.path import isfile, basename, isdir, islink, realpath, getsize
+from collections import defaultdict, Counter
+from multiprocessing import Pool
+import argparse
+import shutil
+import glob
+import time
+import sys
+import os 
+
+def sum_size(files):
+    folder_to_size = defaultdict(int)
+    for f,size in files:
+        for i in range(1,len(f.split("/"))):
+            folder = "/".join(f.split("/")[:-i])
+            folder_to_size[folder]+=size
+    return folder_to_size
+
+# https://stackoverflow.com/questions/1094841/get-human-readable-version-of-file-size
+def sizeof_fmt(num, suffix="B"):
+    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}Yi{suffix}"
+
+
+def get_files(cwd):
+    dirs = []
+    files = []
+    ignore = {"%s/."%cwd,"%s/.."%cwd}
+    for el in glob.glob("%s/*"%cwd):
+        if islink(el):
+            continue
+        if isdir(el):
+            dirs.append(el)
+        else:
+            files.append(el)
+    for el in glob.glob("%s/.*"%cwd):
+        if el in ignore:
+            continue
+        if islink(el):
+            continue
+        if isdir(el):
+            dirs.append(el)
+        else:
+            files.append(el)
+    return dirs,files
+
+def parallel_list_files(cwd,threads):
+    pool = Pool(threads)
+    dirs,files = get_files(cwd)
+    while dirs:
+        res = pool.map(get_files,dirs)
+        dirs = []
+        for _dirs,_files in res:
+            files += _files
+            dirs += _dirs
+        print(len(dirs),len(files))
+    del pool
+    return files
+
+def better_getsize(file):
+    try:
+        return getsize(file)
+    except:
+        return 0
+
+def dup(cwd,threads):
+    start = time.time()
+    files = parallel_list_files(cwd,threads)
+    print("%s files listed in %s s"%(len(files),time.time()-start))
+
+    # get size of each file
+    start = time.time()
+    pool = Pool(threads)
+    sizes = pool.map(better_getsize,files)
+    print("size assessed in %s s"%(time.time()-start))
+
+    # sum size
+    start = time.time()
+    batchs = [zip(files[i::threads],sizes[i::threads]) for i in range(threads)]
+    res = pool.map(sum_size,batchs)
+    fold_to_size = defaultdict(int)
+    for f_to_s in res:
+        for f,s in f_to_s.items():
+            fold_to_size[f]+=s
+    print("size summed/formated in %s s"%(time.time()-start))
+
+    # output:
+    ignore = { "/".join(cwd.split("/")[:-i]) for i in range(1,len(cwd.split("/")))} 
+    fold_size_sorted = sorted(fold_to_size.items(),key=lambda x:x[1])
+    fold_size_formated = [[f,sizeof_fmt(s)] for f,s in fold_size_sorted if f not in ignore]
+    for f,s in fold_size_formated:
+        print("%s\t%s"%(s,f))
+
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", help="folder to assess")
+    parser.add_argument("threads", help="nb threads",default=10)
+    args = parser.parse_args()
+    dup(realpath(args.path),int(args.threads))
